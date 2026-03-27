@@ -13,10 +13,103 @@ Methodology (Weinstein Stage 2):
 
 from __future__ import annotations
 
+import io
+import re
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import find_peaks
+
+
+# ---------------------------------------------------------------------------
+# Text-format parser  (offline / no-network fallback)
+# ---------------------------------------------------------------------------
+
+def parse_price_data(text: str) -> pd.DataFrame:
+    """Parse the fixed-width price table format into a daily OHLCV DataFrame.
+
+    Accepts input in the format::
+
+        XLE, Daily
+        Day       Date       Open       High        Low      Close      Volume
+        === ========== ========== ========== ========== ========== ===========
+        Fri 03-27-2026     61.530     62.790     61.260     62.560    59254272
+
+    The ticker/header lines and the separator line (``===``) are ignored
+    automatically.  Dates may be ``MM-DD-YYYY`` or ``MM-DD-YY``.
+
+    Parameters
+    ----------
+    text : str
+        Raw text block containing the price table.
+
+    Returns
+    -------
+    pd.DataFrame
+        Daily OHLCV DataFrame sorted oldest-first, with a ``DatetimeIndex``.
+    """
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        # Skip blank lines, header/title lines, and separator lines
+        if not line or re.match(r'^[A-Za-z,\s]+$', line) or line.startswith('===') or line.startswith('Day'):
+            continue
+        parts = line.split()
+        # Expect: DayName  Date  Open  High  Low  Close  Volume
+        if len(parts) < 7:
+            continue
+        try:
+            date = pd.to_datetime(parts[1], format='%m-%d-%Y', errors='coerce')
+            if pd.isna(date):
+                date = pd.to_datetime(parts[1], format='%m-%d-%y', errors='coerce')
+            if pd.isna(date):
+                continue
+            rows.append({
+                'Date':   date,
+                'Open':   float(parts[2]),
+                'High':   float(parts[3]),
+                'Low':    float(parts[4]),
+                'Close':  float(parts[5]),
+                'Volume': float(parts[6]),
+            })
+        except (ValueError, IndexError):
+            continue
+
+    if not rows:
+        raise ValueError("No valid price rows found in the provided text.")
+
+    df = pd.DataFrame(rows).set_index('Date').sort_index()
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Weekly resampling
+# ---------------------------------------------------------------------------
+
+def resample_to_weekly(daily_df: pd.DataFrame) -> pd.DataFrame:
+    """Resample a daily OHLCV DataFrame to weekly bars (week ending Monday).
+
+    Parameters
+    ----------
+    daily_df : pd.DataFrame
+        Daily OHLCV data with a ``DatetimeIndex``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Weekly OHLCV bars, one row per week, sorted oldest-first.
+    """
+    agg = {
+        'Open':   'first',
+        'High':   'max',
+        'Low':    'min',
+        'Close':  'last',
+        'Volume': 'sum',
+    }
+    weekly = daily_df.resample('W-MON', label='left', closed='left').agg(agg)
+    weekly.dropna(subset=['Close'], inplace=True)
+    return weekly
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +360,7 @@ def detect_breakouts(
     prominence: float = 0.5,
     volume_window: int = 10,
     volume_multiplier: float = 1.5,
+    raw_text: str | None = None,
 ) -> list[dict]:
     """Detect all confirmed breakouts for *ticker* on weekly bars.
 
@@ -276,9 +370,10 @@ def detect_breakouts(
     Parameters
     ----------
     ticker : str
-        Ticker symbol (e.g. ``"XLE"``).
+        Ticker symbol (e.g. ``"XLE"``).  Only used when *raw_text* is ``None``.
     period : str
         Historical look-back passed to yfinance (default ``"5y"``).
+        Ignored when *raw_text* is provided.
     lookback : int
         Minimum bars between swing highs (default 5 weeks).
     prominence : float
@@ -287,6 +382,11 @@ def detect_breakouts(
         Rolling window for average volume baseline (default 10 bars).
     volume_multiplier : float
         Required volume multiple for breakout confirmation (default 1.5×).
+    raw_text : str or None
+        Optional pre-fetched price data in the fixed-width text format
+        (see :func:`parse_price_data`).  When supplied, yfinance is not called
+        and the data is parsed and resampled to weekly bars locally.  Useful
+        when network access to Yahoo Finance is unavailable.
 
     Returns
     -------
@@ -295,11 +395,26 @@ def detect_breakouts(
 
     Examples
     --------
-    >>> results = detect_breakouts("XLE", period="5y")
-    >>> for event in results:
-    ...     print(event)
+    Fetch live data via yfinance::
+
+        results = detect_breakouts("XLE", period="5y")
+
+    Use a locally-pasted price table instead::
+
+        text = \"\"\"
+        XLE, Daily
+        Day       Date       Open  ...
+        Fri 03-27-2026  61.53  ...
+        \"\"\"
+        results = detect_breakouts("XLE", raw_text=text)
+
     """
-    df = fetch_weekly_data(ticker, period=period)
+    if raw_text is not None:
+        daily_df = parse_price_data(raw_text)
+        df = resample_to_weekly(daily_df)
+    else:
+        df = fetch_weekly_data(ticker, period=period)
+
     resistance_levels = get_resistance_levels(df, lookback=lookback, prominence=prominence)
     return confirm_breakouts(
         df,
